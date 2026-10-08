@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IoT Racing - Équipe</title>
+<style>
+body{margin:0;background:#15171c;color:#f2f2f2;font:15px system-ui,sans-serif;text-align:center}
+h3{margin:8px;font-size:20px}
+#hud{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;max-width:420px;margin:auto;padding:0 6px 6px}
+#hud div{background:#242730;border-left:4px solid #e63946;padding:3px 6px;text-align:left;font-size:12px}
+#hud b{display:block;font-size:17px}
+canvas{width:100%;max-width:420px;touch-action:none}
+.ok{color:#5f5}.ko{color:#f66}
+</style></head><body>
+<h3 id="title"></h3>
+<div id="hud">
+<div>Score<b id="sc">0</b></div><div>Vitesse<b id="sp">0</b></div><div>Direction<b id="di">-</b></div>
+<div>Turbo<b id="tu">READY</b></div><div>Moteur<b id="te">--</b></div><div>MQTT<b id="mq" class="ko">...</b></div>
+</div>
+<canvas id="cv" width="360" height="560"></canvas>
+<script src="mqtt.min.js"></script>
+<script>
+// ===== CONFIG (à modifier) =====
+const BROKER_URL='ws://192.168.1.10:9001';      // broker local (Mosquitto, port WebSocket)
+// const BROKER_URL='wss://broker.hivemq.com:8884/mqtt';  // broker public (changer aussi PREFIX !)
+const PREFIX='iot-racing/';
+const SCORE={dodge:50,jump:75,turbo:50,finish:500,crash:-50,missJump:-25,overheat:-100};
+const TEMP_HOT=3, TEMP_OVERHEAT=6;               // °C au-dessus de la 1re température reçue
+const TURBO_MS=3000, TURBO_COOLDOWN_MS=5000, TURBO_BOOST=1.6;
+const BASE_SPEED=220, FINISH_DIST=15000, JUMP_AIR_MS=900;
+
+// ===== Initialisation =====
+const $=id=>document.getElementById(id);
+const P=new URLSearchParams(location.search);
+const TEAM=(P.get('team')||'G1').toUpperCase(), DEBUG=P.has('debug');
+const T=n=>PREFIX+TEAM+'/'+n;
+const LANE={left:0,center:1,right:2};
+const W=360,H=560,LW=W/3,CAR_Y=460;
+const cv=$('cv'),g=cv.getContext('2d');
+$('title').textContent='Équipe '+TEAM;
+let S, temp=null, base=null, tstate='NORMAL';
+
+function reset(){S={run:false,done:false,score:0,lane:1,x:LW*1.5,dir:S?S.dir:'center',jumpUntil:0,obs:[],spawn:0,dist:0,speed:0,turbo:'READY',turboAt:0,msg:'',msgAt:0};pub();}
+function pub(){if(c.connected)c.publish(T('score'),String(S.score));}
+function add(p,text){S.score+=p;S.msg=text+' '+(p>0?'+':'')+p;S.msgAt=performance.now();pub();}
+
+// ===== MQTT =====
+const c=mqtt.connect(BROKER_URL,{clientId:'web-'+TEAM+'-'+Math.random().toString(16).slice(2,8),reconnectPeriod:2000});
+c.on('connect',()=>{$('mq').textContent='OK';$('mq').className='ok';
+  c.subscribe([T('direction'),T('jump'),T('turbo'),T('temperature'),PREFIX+'game']);pub();});
+c.on('close',()=>{$('mq').textContent='HORS LIGNE';$('mq').className='ko';});
+c.on('message',(t,m)=>{
+  const v=m.toString().trim(), k=t.split('/').pop();
+  if(k==='game'){ if(v==='start'){reset();S.run=true;} else if(v==='stop'){S.run=false;} }
+  else if(k==='direction'&&v in LANE){S.dir=v;S.lane=LANE[v];}
+  else if(k==='jump')doJump();
+  else if(k==='turbo')doTurbo();
+  else if(k==='temperature')setTemp(parseFloat(v));
+});
+
+// ===== Règles =====
+function doJump(){ if(S.run) S.jumpUntil=performance.now()+JUMP_AIR_MS; }
+function doTurbo(){ if(S.run&&S.turbo==='READY'){S.turbo='ACTIVE';S.turboAt=performance.now();add(SCORE.turbo,'Turbo !');} }
+function setTemp(t){
+  if(isNaN(t))return; temp=t; if(base===null)base=t;
+  const d=t-base, st=d>=TEMP_OVERHEAT?'OVERHEAT':d>=TEMP_HOT?'HOT':'NORMAL';
+  if(st==='OVERHEAT'&&tstate!=='OVERHEAT'&&S.run)add(SCORE.overheat,'Surchauffe');
+  tstate=st;
+}
+function update(dt,now){
+  S.x+=(S.lane*LW+LW/2-S.x)*Math.min(1,dt*15);
+  if(!S.run)return;
+  if(S.turbo==='ACTIVE'&&now-S.turboAt>TURBO_MS){S.turbo='COOLDOWN';S.turboAt=now;}
+  else if(S.turbo==='COOLDOWN'&&now-S.turboAt>TURBO_COOLDOWN_MS)S.turbo='READY';
+  S.speed=BASE_SPEED*(S.turbo==='ACTIVE'?TURBO_BOOST:1)*(tstate==='OVERHEAT'?0.6:1);
+  S.dist+=S.speed*dt; S.spawn-=S.speed*dt;
+  if(S.spawn<=0){S.spawn=300+Math.random()*250;S.obs.push({lane:Math.random()*3|0,y:-40,bar:Math.random()<0.3,done:false});}
+  for(const o of S.obs){
+    o.y+=S.speed*dt;
+    if(!o.done&&o.y>=CAR_Y){o.done=true;
+      if(o.bar) now<S.jumpUntil?add(SCORE.jump,'Saut réussi'):add(SCORE.missJump,'Saut raté');
+      else o.lane===S.lane?add(SCORE.crash,'Collision'):add(SCORE.dodge,'Évité');
+    }
+  }
+  S.obs=S.obs.filter(o=>o.y<H+50);
+  if(S.dist>=FINISH_DIST){S.run=false;S.done=true;S.speed=0;add(SCORE.finish,'ARRIVÉE !');}
+}
+
+// ===== Dessin =====
+function draw(now){
+  g.fillStyle='#33363f';g.fillRect(0,0,W,H);
+  g.fillStyle='#e63946';for(let y=-(S.dist%40);y<H;y+=40){g.fillRect(0,y,6,20);g.fillRect(W-6,y+20,6,20);}
+  g.strokeStyle='#888';g.setLineDash([24,24]);g.lineDashOffset=S.dist%48;
+  for(let i=1;i<3;i++){g.beginPath();g.moveTo(i*LW,0);g.lineTo(i*LW,H);g.stroke();}
+  g.setLineDash([]);
+  for(const o of S.obs){
+    if(o.bar){g.fillStyle='#ffc300';g.fillRect(8,o.y-8,W-16,16);}
+    else{g.fillStyle='#d62828';g.fillRect(o.lane*LW+24,o.y-26,LW-48,52);}
+  }
+  const air=now<S.jumpUntil, s=air?1.3:1;
+  g.fillStyle='#0006';g.fillRect(S.x-20,CAR_Y-30,40,66);
+  g.fillStyle=S.turbo==='ACTIVE'?'#2ee6e6':'#2fbf71';
+  g.fillRect(S.x-20*s,CAR_Y-35*s-(air?22:0),40*s,70*s);
+  g.fillStyle='#fff';g.fillRect(S.x-12*s,CAR_Y-26*s-(air?22:0),24*s,14*s);
+  g.fillStyle='#ffc300';g.fillRect(0,0,W*Math.min(1,S.dist/FINISH_DIST),6);
+  g.textAlign='center';g.fillStyle='#fff';
+  if(now-S.msgAt<1200){g.font='bold 24px system-ui';g.fillText(S.msg,W/2,90);}
+  if(!S.run){g.fillStyle='#000a';g.fillRect(0,230,W,90);g.fillStyle='#fff';g.font='bold 22px system-ui';
+    g.fillText(S.done?'ARRIVÉE ! Score '+S.score:'En attente du START...',W/2,282);}
+}
+function hud(){
+  $('sc').textContent=S.score; $('sp').textContent=Math.round(S.speed/4)+' km/h'; $('di').textContent=S.dir;
+  $('tu').textContent=S.turbo==='ACTIVE'?'ACTIF':S.turbo;
+  $('te').textContent=temp===null?'--':temp.toFixed(1)+'°C '+tstate;
+}
+
+// ===== Test sans ESP32 : ouvrir team.html?team=G1&debug=1 =====
+if(DEBUG)addEventListener('keydown',e=>{
+  const k=e.key;
+  if(k==='ArrowLeft'){S.dir='left';S.lane=0;} else if(k==='ArrowDown'){S.dir='center';S.lane=1;}
+  else if(k==='ArrowRight'){S.dir='right';S.lane=2;} else if(k===' ')doJump();
+  else if(k==='t')doTurbo(); else if(k==='s'){reset();S.run=true;}
+});
+
+reset();
+let last=performance.now();
+(function f(now){const dt=Math.min((now-last)/1000,.1);last=now;update(dt,now);draw(now);hud();requestAnimationFrame(f);})(last);
+</script></body></html>

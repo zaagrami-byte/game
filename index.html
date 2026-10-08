@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IoT Racing - Game Master</title>
+<style>
+body{margin:0;padding:12px;background:#15171c;color:#f2f2f2;font:16px system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;border-bottom:4px solid #e63946;padding-bottom:8px}
+h1{margin:0;font-size:24px}
+button{font:bold 18px system-ui;padding:10px 22px;border:0;border-radius:4px;color:#fff;cursor:pointer}
+#go{background:#2fbf71}#st{background:#d62828}
+table{width:100%;border-collapse:collapse;margin:12px 0}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #2c303a}
+td.s{font-size:22px;font-weight:bold}
+.on{color:#5f5}.off{color:#f66}.ok{color:#5f5}.ko{color:#f66}
+ul{list-style:none;padding:0;margin:0;font-size:14px;color:#c8ccd4}
+li{padding:3px 0;border-bottom:1px solid #22252d}
+</style></head><body>
+<header><h1>IoT Racing - Game Master</h1>
+<div>MQTT : <b id="mq" class="ko">...</b> &nbsp; <button id="go">START</button> <button id="st">STOP</button></div></header>
+<table><thead><tr><th>#</th><th>Équipe</th><th>État</th><th>Score</th><th>Moteur</th></tr></thead><tbody id="tb"></tbody></table>
+<h3>Derniers événements</h3><ul id="ev"></ul>
+<script src="mqtt.min.js"></script>
+<script>
+// ===== CONFIG (à modifier) =====
+const BROKER_URL='ws://192.168.1.10:9001';      // broker local (Mosquitto, port WebSocket)
+// const BROKER_URL='wss://broker.hivemq.com:8884/mqtt';  // broker public (changer aussi PREFIX !)
+const PREFIX='iot-racing/';
+const OFFLINE_MS=10000;      // OFFLINE si aucun message de l'ESP32 depuis 10 s
+const MAX_EVENTS=12;
+
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[<>&"]/g,'');
+const teams={};
+const get=id=>teams[id]||(teams[id]={score:0,temp:null,seen:0});
+
+const c=mqtt.connect(BROKER_URL,{clientId:'master-'+Math.random().toString(16).slice(2,8),reconnectPeriod:2000});
+c.on('connect',()=>{$('mq').textContent='OK';$('mq').className='ok';
+  c.subscribe(['score','temperature','direction','jump','turbo'].map(k=>PREFIX+'+/'+k));});
+c.on('close',()=>{$('mq').textContent='HORS LIGNE';$('mq').className='ko';});
+c.on('message',(t,m)=>{
+  const [id,k]=t.slice(PREFIX.length).split('/'), v=m.toString().trim(), tm=get(id);
+  if(k==='score'){tm.score=parseInt(v)||0;}
+  else{
+    tm.seen=Date.now();                       // température = signal de vie de l'ESP32
+    if(k==='temperature')tm.temp=parseFloat(v);
+    else log(id+' : '+k+(k==='direction'?' → '+v:''));
+  }
+  render();
+});
+
+function log(text){
+  const li=document.createElement('li');
+  li.textContent=new Date().toLocaleTimeString()+'  '+text;
+  $('ev').prepend(li);
+  while($('ev').children.length>MAX_EVENTS)$('ev').lastChild.remove();
+}
+function send(cmd){c.publish(PREFIX+'game',cmd);log('GAME MASTER : '+cmd.toUpperCase());}
+$('go').onclick=()=>send('start');
+$('st').onclick=()=>send('stop');
+
+function render(){
+  const rows=Object.entries(teams).sort((a,b)=>b[1].score-a[1].score);
+  $('tb').innerHTML=rows.map(([id,t],i)=>{
+    const on=Date.now()-t.seen<OFFLINE_MS;
+    return '<tr><td>'+(i+1)+'</td><td>'+esc(id)+'</td><td class="'+(on?'on':'off')+'">'+(on?'ONLINE':'OFFLINE')+
+      '</td><td class="s">'+t.score+'</td><td>'+(t.temp===null?'--':t.temp.toFixed(1)+' °C')+'</td></tr>';
+  }).join('');
+}
+setInterval(render,1000);   // met à jour ONLINE/OFFLINE même sans message
+</script></body></html>
